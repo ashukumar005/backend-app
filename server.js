@@ -10,7 +10,7 @@ app.use(cors());
 app.use(express.json());
 
 ////////////////////////////////////////////////////////////
-/// 🔥 FIREBASE ADMIN SETUP
+/// 🔥 FIREBASE
 ////////////////////////////////////////////////////////////
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
@@ -22,7 +22,7 @@ admin.initializeApp({
 const db = admin.firestore();
 
 ////////////////////////////////////////////////////////////
-/// 🔑 RAZORPAY SETUP
+/// 🔑 RAZORPAY
 ////////////////////////////////////////////////////////////
 
 const razorpay = new Razorpay({
@@ -31,7 +31,7 @@ const razorpay = new Razorpay({
 });
 
 ////////////////////////////////////////////////////////////
-/// 🧪 TEST API
+/// 🧪 TEST
 ////////////////////////////////////////////////////////////
 
 app.get("/", (req, res) => {
@@ -44,27 +44,45 @@ app.get("/", (req, res) => {
 
 app.post("/create-order", async (req, res) => {
   try {
-    const { amount, bookingId, userId, providerId } = req.body;
+    const { bookingId, amount, type } = req.body;
 
-    // ✅ VALIDATION
-    if (!amount || !bookingId) {
+    if (!bookingId || !amount || !type) {
       return res.status(400).json({
-        error: "Amount & BookingId required",
+        error: "bookingId, amount, type required",
       });
     }
 
-    // ✅ CREATE RAZORPAY ORDER
+    // 🔥 booking fetch
+    const bookingDoc = await db.collection("bookings").doc(bookingId).get();
+
+    if (!bookingDoc.exists) {
+      return res.status(404).json({ error: "Booking not found" });
+    }
+
+    const booking = bookingDoc.data();
+
+    // ❗ duplicate protection
+    if (type === "advance" && booking.advancePaid) {
+      return res.status(400).json({ error: "Advance already paid" });
+    }
+
+    if (type === "final" && booking.finalPaid) {
+      return res.status(400).json({ error: "Final already paid" });
+    }
+
+    // 🔥 Razorpay order
     const order = await razorpay.orders.create({
       amount: amount * 100,
       currency: "INR",
     });
 
-    // ✅ SAFE FIRESTORE SAVE
+    // 🔥 Save payment
     await db.collection("payments").doc(order.id).set({
       orderId: order.id,
-      bookingId: bookingId || null,
-      userId: userId || null,
-      providerId: providerId || null,
+      bookingId,
+      userId: booking.customerId,
+      providerId: booking.providerId,
+      type,
       amount,
       status: "created",
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -89,52 +107,78 @@ app.post("/verify-payment", async (req, res) => {
       return res.status(400).json({ error: "BookingId required" });
     }
 
-    // ✅ SIGNATURE VERIFY (SECURE)
+    // 🔐 verify signature
     const generated_signature = crypto
       .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
       .update(order_id + "|" + payment_id)
       .digest("hex");
 
-    if (generated_signature === signature) {
-      ////////////////////////////////////////////////////////////
-      /// ✅ PAYMENT SUCCESS
-      ////////////////////////////////////////////////////////////
-
-      // 🔥 Update payment
-      await db.collection("payments").doc(order_id).update({
-        paymentId: payment_id,
-        status: "success",
-        paidAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      // 🔥 Update booking
-      await db.collection("bookings").doc(bookingId).update({
-        status: "advance_paid",
-        paymentId: payment_id,
-        paidAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      ////////////////////////////////////////////////////////////
-      /// 💰 PROVIDER WALLET
-      ////////////////////////////////////////////////////////////
-
-      const bookingDoc = await db.collection("bookings").doc(bookingId).get();
-      const bookingData = bookingDoc.data();
-
-      const providerId = bookingData.providerId;
-      const amount = bookingData.advanceAmount;
-
-      const commission = amount * 0.1;
-      const providerAmount = amount - commission;
-
-      await db.collection("providers").doc(providerId).update({
-        wallet: admin.firestore.FieldValue.increment(providerAmount),
-      });
-
-      res.json({ success: true });
-    } else {
-      res.json({ success: false });
+    if (generated_signature !== signature) {
+      return res.json({ success: false });
     }
+
+    ////////////////////////////////////////////////////////////
+    /// 🔥 GET PAYMENT + BOOKING
+    ////////////////////////////////////////////////////////////
+
+    const paymentRef = db.collection("payments").doc(order_id);
+    const paymentDoc = await paymentRef.get();
+    const payment = paymentDoc.data();
+
+    const bookingRef = db.collection("bookings").doc(bookingId);
+    const bookingDoc = await bookingRef.get();
+    const booking = bookingDoc.data();
+
+    ////////////////////////////////////////////////////////////
+    /// 🔥 UPDATE PAYMENT
+    ////////////////////////////////////////////////////////////
+
+    await paymentRef.update({
+      paymentId: payment_id,
+      status: "success",
+      paidAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    ////////////////////////////////////////////////////////////
+    /// 🔥 ADVANCE PAYMENT
+    ////////////////////////////////////////////////////////////
+
+    if (payment.type === "advance") {
+      await bookingRef.update({
+        advancePaid: true,
+        status: "advance_paid",
+      });
+    }
+
+    ////////////////////////////////////////////////////////////
+    /// 🔥 FINAL PAYMENT
+    ////////////////////////////////////////////////////////////
+
+    if (payment.type === "final") {
+      // 💰 wallet update only once
+      if (!booking.isCounted) {
+        const commission = booking.totalPrice * 0.1;
+        const providerAmount = booking.totalPrice - commission;
+
+        await db.collection("providers").doc(booking.providerId).update({
+          wallet: admin.firestore.FieldValue.increment(providerAmount),
+          totalJobs: admin.firestore.FieldValue.increment(1),
+          totalEarnings: admin.firestore.FieldValue.increment(providerAmount),
+        });
+
+        await bookingRef.update({
+          isCounted: true,
+        });
+      }
+
+      await bookingRef.update({
+        finalPaid: true,
+        status: "completed",
+        completedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+
+    res.json({ success: true });
   } catch (error) {
     console.log("VERIFY ERROR:", error);
     res.status(500).send("Verification error");
@@ -161,12 +205,10 @@ app.post("/withdraw", async (req, res) => {
       });
     }
 
-    // 🔥 Deduct wallet
     await providerRef.update({
       wallet: admin.firestore.FieldValue.increment(-amount),
     });
 
-    // 🔥 Create withdrawal request
     await db.collection("withdrawals").add({
       providerId,
       amount,
@@ -182,7 +224,7 @@ app.post("/withdraw", async (req, res) => {
 });
 
 ////////////////////////////////////////////////////////////
-/// 🚀 START SERVER
+/// 🚀 SERVER
 ////////////////////////////////////////////////////////////
 
 const PORT = process.env.PORT || 5000;
