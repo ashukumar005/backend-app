@@ -52,7 +52,6 @@ app.post("/create-order", async (req, res) => {
       });
     }
 
-    // 🔥 booking fetch
     const bookingDoc = await db.collection("bookings").doc(bookingId).get();
 
     if (!bookingDoc.exists) {
@@ -61,7 +60,6 @@ app.post("/create-order", async (req, res) => {
 
     const booking = bookingDoc.data();
 
-    // ❗ duplicate protection
     if (type === "advance" && booking.advancePaid) {
       return res.status(400).json({ error: "Advance already paid" });
     }
@@ -70,13 +68,11 @@ app.post("/create-order", async (req, res) => {
       return res.status(400).json({ error: "Final already paid" });
     }
 
-    // 🔥 Razorpay order
     const order = await razorpay.orders.create({
       amount: amount * 100,
       currency: "INR",
     });
 
-    // 🔥 Save payment
     await db.collection("payments").doc(order.id).set({
       orderId: order.id,
       bookingId,
@@ -103,11 +99,6 @@ app.post("/verify-payment", async (req, res) => {
   try {
     const { order_id, payment_id, signature, bookingId } = req.body;
 
-    if (!bookingId) {
-      return res.status(400).json({ error: "BookingId required" });
-    }
-
-    // 🔐 verify signature
     const generated_signature = crypto
       .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
       .update(order_id + "|" + payment_id)
@@ -117,10 +108,6 @@ app.post("/verify-payment", async (req, res) => {
       return res.json({ success: false });
     }
 
-    ////////////////////////////////////////////////////////////
-    /// 🔥 GET PAYMENT + BOOKING
-    ////////////////////////////////////////////////////////////
-
     const paymentRef = db.collection("payments").doc(order_id);
     const paymentDoc = await paymentRef.get();
     const payment = paymentDoc.data();
@@ -129,10 +116,6 @@ app.post("/verify-payment", async (req, res) => {
     const bookingDoc = await bookingRef.get();
     const booking = bookingDoc.data();
 
-    ////////////////////////////////////////////////////////////
-    /// 🔥 UPDATE PAYMENT
-    ////////////////////////////////////////////////////////////
-
     await paymentRef.update({
       paymentId: payment_id,
       status: "success",
@@ -140,7 +123,7 @@ app.post("/verify-payment", async (req, res) => {
     });
 
     ////////////////////////////////////////////////////////////
-    /// 🔥 ADVANCE PAYMENT
+    /// ADVANCE PAYMENT
     ////////////////////////////////////////////////////////////
 
     if (payment.type === "advance") {
@@ -151,11 +134,10 @@ app.post("/verify-payment", async (req, res) => {
     }
 
     ////////////////////////////////////////////////////////////
-    /// 🔥 FINAL PAYMENT
+    /// FINAL PAYMENT
     ////////////////////////////////////////////////////////////
 
     if (payment.type === "final") {
-      // 💰 wallet update only once
       if (!booking.isCounted) {
         const commission = booking.totalPrice * 0.1;
         const providerAmount = booking.totalPrice - commission;
@@ -186,40 +168,76 @@ app.post("/verify-payment", async (req, res) => {
 });
 
 ////////////////////////////////////////////////////////////
-/// 💰 WITHDRAW
+/// 💰 WITHDRAW (PRODUCTION SAFE)
 ////////////////////////////////////////////////////////////
 
 app.post("/withdraw", async (req, res) => {
   try {
     const { providerId, amount } = req.body;
 
-    const providerRef = db.collection("providers").doc(providerId);
-    const providerDoc = await providerRef.get();
-
-    const wallet = providerDoc.data().wallet || 0;
-
-    if (wallet < amount) {
-      return res.json({
+    if (!providerId || !amount) {
+      return res.status(400).json({
         success: false,
-        message: "Insufficient balance",
+        message: "providerId and amount required",
       });
     }
 
-    await providerRef.update({
-      wallet: admin.firestore.FieldValue.increment(-amount),
+    if (amount <= 0 || amount < 100) {
+      return res.json({
+        success: false,
+        message: "Minimum ₹100 required",
+      });
+    }
+
+    const providerRef = db.collection("providers").doc(providerId);
+
+    await db.runTransaction(async (t) => {
+      const doc = await t.get(providerRef);
+
+      if (!doc.exists) throw new Error("Provider not found");
+
+      const data = doc.data();
+      const wallet = data.wallet || 0;
+
+      if (amount > wallet) {
+        throw new Error("Insufficient balance");
+      }
+
+      ////////////////////////////////////////////////////////////
+      /// WALLET DEDUCT
+      ////////////////////////////////////////////////////////////
+
+      t.update(providerRef, {
+        wallet: admin.firestore.FieldValue.increment(-amount),
+      });
+
+      ////////////////////////////////////////////////////////////
+      /// CREATE WITHDRAW ENTRY
+      ////////////////////////////////////////////////////////////
+
+      const withdrawRef = db.collection("withdrawals").doc();
+
+      t.set(withdrawRef, {
+        providerId,
+        amount,
+        status: "pending",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        processedAt: null,
+        method: "upi",
+        upi: data.upi || null,
+      });
     });
 
-    await db.collection("withdrawals").add({
-      providerId,
-      amount,
-      status: "pending",
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    res.json({
+      success: true,
+      message: "Withdraw request created",
     });
-
-    res.json({ success: true });
   } catch (error) {
     console.log("WITHDRAW ERROR:", error);
-    res.status(500).send("Withdraw error");
+    res.json({
+      success: false,
+      message: error.message || "Withdraw failed",
+    });
   }
 });
 
