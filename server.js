@@ -15,8 +15,8 @@ app.use(express.json());
 /// 🔥 FIREBASE
 ////////////////////////////////////////////////////////////
 
-const serviceAccount = JSON.parse(
-  process.env.FIREBASE_KEY
+const serviceAccount = require(
+  "./serviceAccountKey.json"
 );
 
 admin.initializeApp({
@@ -26,6 +26,93 @@ admin.initializeApp({
 });
 
 const db = admin.firestore();
+
+////////////////////////////////////////////////////////////
+/// 🔔 SEND NOTIFICATION
+////////////////////////////////////////////////////////////
+
+async function sendNotification({
+  receiverId,
+  title,
+  body,
+  collection = "users",
+  data = {},
+}) {
+
+console.log(
+  "🔥 sendNotification called"
+);
+
+console.log(
+  "Receiver:",
+  receiverId
+);
+
+console.log(
+  "Collection:",
+  collection
+);
+
+  try {
+
+    const doc = await db
+      .collection(collection)
+      .doc(receiverId)
+      .get();
+
+    if (!doc.exists) {
+      console.log("❌ Receiver not found");
+      return;
+    }
+
+    const token = doc.data()?.fcmToken;
+
+    if (!token) {
+      console.log("❌ Token missing");
+      return;
+    }
+
+    const message = {
+
+      token,
+
+      notification: {
+        title,
+        body,
+      },
+
+      data: {
+        ...data,
+      },
+
+      android: {
+        priority: "high",
+
+        notification: {
+          channelId:
+            "high_importance_channel",
+
+          sound: "default",
+        },
+      },
+    };
+
+    await admin.messaging().send(
+      message
+    );
+
+    console.log(
+      "✅ Notification Sent"
+    );
+
+  } catch (e) {
+
+    console.log(
+      "❌ Notification Error:",
+      e
+    );
+  }
+}
 
 ////////////////////////////////////////////////////////////
 /// 🔑 RAZORPAY
@@ -50,6 +137,9 @@ app.get("/", (req, res) => {
 ////////////////////////////////////////////////////////////
 
 app.post("/create-order", async (req, res) => {
+console.log(
+  "🔥 CREATE ORDER API HIT"
+);
   try {
     const { bookingId, amount, type } =
       req.body;
@@ -150,6 +240,33 @@ app.post("/create-order", async (req, res) => {
     ////////////////////////////////////////////////////////////
     /// RESPONSE
     ////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////
+/// 🔥 NEW BOOKING NOTIFICATION
+////////////////////////////////////////////////////////////
+
+if (type === "advance") {
+
+  await sendNotification({
+
+    receiverId:
+      booking.providerId,
+
+    collection:
+      "providers",
+
+    title:
+      "New Booking 🚀",
+
+    body:
+      "You received a new booking",
+
+    data: {
+      type: "booking",
+      bookingId,
+    },
+  });
+}
 
     res.json(order);
 
@@ -280,6 +397,30 @@ app.post(
         });
       }
 
+////////////////////////////////////////////////////////////
+/// 🔔 PROVIDER NOTIFICATION
+////////////////////////////////////////////////////////////
+
+await sendNotification({
+
+  receiverId:
+    booking.providerId,
+
+  collection:
+    "providers",
+
+  title:
+    "Advance Paid 💰",
+
+  body:
+    "Customer paid advance amount",
+
+  data: {
+    type: "advance_paid",
+    bookingId,
+  },
+});
+
       ////////////////////////////////////////////////////////////
       /// FINAL PAYMENT
       ////////////////////////////////////////////////////////////
@@ -341,6 +482,56 @@ app.post(
             admin.firestore.FieldValue.serverTimestamp(),
         });
       }
+
+////////////////////////////////////////////////////////////
+/// 🔔 USER NOTIFICATION
+////////////////////////////////////////////////////////////
+
+await sendNotification({
+
+  receiverId:
+    booking.customerId,
+
+  collection:
+    "users",
+
+  title:
+    "Payment Successful ✅",
+
+  body:
+    "Booking completed successfully",
+
+  data: {
+    type: "payment_success",
+    bookingId,
+  },
+});
+
+////////////////////////////////////////////////////////////
+/// 🔔 PROVIDER NOTIFICATION
+////////////////////////////////////////////////////////////
+
+await sendNotification({
+
+  receiverId:
+    booking.providerId,
+
+  collection:
+    "providers",
+
+  title:
+    "Payment Received 💸",
+
+  body:
+    "Payment added to wallet",
+
+  data: {
+    type: "payment_received",
+    bookingId,
+  },
+});
+
+
 
       ////////////////////////////////////////////////////////////
       /// RESPONSE
@@ -498,7 +689,30 @@ app.post("/withdraw", async (req, res) => {
         );
       }
     );
+    
+////////////////////////////////////////////////////////////
+/// 🔔 PROVIDER NOTIFICATION
+////////////////////////////////////////////////////////////
 
+await sendNotification({
+
+  receiverId:
+    providerId,
+
+  collection:
+    "providers",
+
+  title:
+    "Withdraw Requested 💰",
+
+  body:
+    "Your withdraw request submitted",
+
+  data: {
+    type: "withdraw_request",
+  },
+});
+    
     ////////////////////////////////////////////////////////////
     /// RESPONSE
     ////////////////////////////////////////////////////////////
@@ -608,6 +822,30 @@ app.post(
 
         isProcessed: true,
       });
+
+////////////////////////////////////////////////////////////
+/// 🔔 PROVIDER NOTIFICATION
+////////////////////////////////////////////////////////////
+
+await sendNotification({
+
+  receiverId:
+    withdraw.providerId,
+
+  collection:
+    "providers",
+
+  title:
+    "Withdraw Approved ✅",
+
+  body:
+    "Money transferred successfully",
+
+  data: {
+    type: "withdraw_approved",
+  },
+});
+
 
       ////////////////////////////////////////////////////////////
       /// RESPONSE
@@ -736,6 +974,31 @@ app.post(
         isProcessed: true,
       });
 
+////////////////////////////////////////////////////////////
+/// 🔔 PROVIDER NOTIFICATION
+////////////////////////////////////////////////////////////
+
+await sendNotification({
+
+  receiverId:
+    withdraw.providerId,
+
+  collection:
+    "providers",
+
+  title:
+    "Withdraw Rejected ❌",
+
+  body:
+    reason || "Withdraw rejected",
+
+  data: {
+    type: "withdraw_rejected",
+  },
+});
+
+
+
       ////////////////////////////////////////////////////////////
       /// RESPONSE
       ////////////////////////////////////////////////////////////
@@ -768,6 +1031,73 @@ app.post(
 const PORT =
   process.env.PORT || 5000;
 
+////////////////////////////////////////////////////////////
+/// 🔔 TEST NOTIFICATION
+////////////////////////////////////////////////////////////
+
+app.get(
+  "/test-notification",
+  async (req, res) => {
+
+    try {
+
+      const token =
+        "eTpK1OLPQymMKeCu_hH0YB:APA91bFFIq8HaID4CfuyI5AH1qNZo6HsYnn0getM2sEYqUFl4Ji8hDXvdPSYMVDZso7qViaUjgwVMF6STjZ8E_KZr6HYKH-o48egzHUIL1Z75LTa9o7wgtM";
+
+      const message = {
+
+        token,
+
+        notification: {
+          title:
+            "Test Notification 🚀",
+
+          body:
+            "Notification system working successfully",
+        },
+
+        android: {
+          priority: "high",
+
+          notification: {
+            channelId:
+              "high_importance_channel",
+          },
+        },
+      };
+
+      await admin
+        .messaging()
+        .send(message);
+
+      console.log(
+        "✅ Test Notification Sent"
+      );
+
+      res.json({
+        success: true,
+      });
+
+    } catch (e) {
+
+      console.log(e);
+
+      res.status(500).json({
+        error: e.message,
+      });
+    }
+  }
+);
+
+////////////////////////////////////////////////////////////
+/// 🚀 SERVER
+////////////////////////////////////////////////////////////
+
+app.listen(PORT, () => {
+  console.log(
+    `Server running on port ${PORT}`
+  );
+});
 app.listen(PORT, () => {
   console.log(
     `Server running on port ${PORT} 🚀`
