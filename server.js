@@ -1024,6 +1024,48 @@ await sendNotification({
   }
 );
 
+
+
+app.post("/send-call-notification", async (req, res) => {
+  try {
+
+    const {
+      receiverId,
+      callerName,
+      bookingId,
+    } = req.body;
+
+    await sendNotification({
+      receiverId,
+      collection: "users",
+
+      title: "📞 Incoming Call",
+
+      body: `${callerName} is calling you`,
+
+      data: {
+        type: "incoming_call",
+        bookingId: bookingId,
+      },
+    });
+
+    res.json({
+      success: true,
+    });
+
+  } catch (e) {
+
+    res.status(500).json({
+      success: false,
+      error: e.message,
+    });
+  }
+});
+
+
+
+
+
 ////////////////////////////////////////////////////////////
 /// 🚀 SERVER
 ////////////////////////////////////////////////////////////
@@ -1096,10 +1138,5 @@ app.get(
 app.listen(PORT, () => {
   console.log(
     `Server running on port ${PORT}`
-  );
-});
-app.listen(PORT, () => {
-  console.log(
-    `Server running on port ${PORT} 🚀`
   );
 });
